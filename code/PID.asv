@@ -1,0 +1,236 @@
+% 系统建模与PID控制器设计
+
+% 定义拉普拉斯变量
+s = tf('s');
+
+% 假设已有系统传递函数（根据之前分析结果）
+K = 9.839;        % 系统增益
+tau = 178.0182;      % 滞后时间
+T = 2859.0614;       % 时间常数
+sys = 3.5*K * exp(-tau*s) / (T*s + 1);  % 传递函数模型
+
+% 目标设定值（摄氏度）
+setpoint = 35;
+
+% 遗传算法参数优化（增加种群大小和迭代次数）
+options = optimoptions('ga', ...
+    'PopulationSize', 100, ...    % 增加种群大小
+    'MaxGenerations', 200, ...   % 增加最大迭代次数
+    'Display', 'iter', ...
+    'PlotFcn', @gaplotbestf, ...
+    'FunctionTolerance', 1e-8, ...
+    'StallGenLimit', 30, ...
+    'CrossoverFraction', 0.8, ...
+    'MutationFcn', @mutationadaptfeasible);  % 使用自适应变异
+
+% 扩大优化参数范围
+fitnessfcn = @(x) pid_fitness(x, sys, setpoint, s);
+lb = [0.1, 0.01, 0.01];     % 放宽Ki和Kd的下限
+ub = [200, 5, 20];         % 显著扩大Kp和Kd的上限
+
+% 使用多次运行取最优解策略
+num_runs = 5;  % 运行遗传算法的次数
+best_fitness = inf;
+best_x = zeros(1,3);
+
+for i = 1:num_runs
+    fprintf('运行遗传算法第 %d 次\n', i);
+    [x, fval] = ga(fitnessfcn, 3, [], [], [], [], lb, ub, [], options);
+    
+    if fval < best_fitness
+        best_fitness = fval;
+        best_x = x;
+    end
+end
+
+% 提取最优PID参数
+Kp = best_x(1);
+Ki = best_x(2);
+Kd = best_x(3);
+fprintf('优化后的PID参数:\n');
+fprintf('Kp = %.4f, Ki = %.4f, Kd = %.4f\n', Kp, Ki, Kd);
+
+% 构建带滤波器的PID控制器（避免零极点不匹配）
+filter_pole = 5;  % 降低滤波器极点，提供更宽的带宽
+pid_controller = Kp + Ki/s + Kd*s/(s/filter_pole + 1);
+
+% 构建闭环控制系统
+sys_cl = feedback(pid_controller * sys, 1);
+
+% 阶跃响应分析 - 延长仿真时间
+t = 0:0.1:5000;  % 延长仿真时间至5000秒，适应大时间常数系统
+[y, t] = step(setpoint * sys_cl, t);
+
+% 计算误差信号
+error_signal = setpoint - y;
+
+% 使用lsim函数计算时域控制信号
+u = lsim(pid_controller, error_signal, t);
+
+% 检查并处理非数值数据
+if any(isnan(u) | isinf(u))
+    fprintf('警告: 控制器输出包含非数值数据 (NaN/Inf)\n');
+    
+    % 找出有效数据的索引
+    valid_idx = ~isnan(u) & ~isinf(u);
+    
+    if sum(valid_idx) > 10  % 确保有足够的有效数据点
+        fprintf('使用有效数据点绘制控制器输出\n');
+        figure;
+        plot(t(valid_idx), u(valid_idx), 'g-', 'LineWidth', 2);
+    else
+        fprintf('有效数据点不足，无法绘制控制器输出\n');
+    end
+else
+    figure;
+    plot(t, u, 'g-', 'LineWidth', 2);
+end
+
+grid on;
+title('PID控制器输出');
+xlabel('时间 (秒)');
+ylabel('控制信号');
+
+% 可视化结果
+figure;
+plot(t, y, 'b-', 'LineWidth', 2);
+hold on;
+plot(t, setpoint * ones(size(t)), 'r--', 'LineWidth', 1.5);
+grid on;
+title('PID控制下的温度响应');
+xlabel('时间 (秒)');
+ylabel('温度 (°C)');
+legend('系统响应', '设定值');
+
+% 计算动态指标
+[yss, idx_yss] = steadyStateValue(y, t);  % 自定义函数计算稳态值
+rise_time = calcRiseTime(y, t, setpoint); % 自定义函数计算上升时间
+settle_time = calcSettleTime(y, t, setpoint); % 自定义函数计算调节时间
+overshoot = calcOvershoot(y, setpoint);   % 自定义函数计算超调量
+
+% 输出动态指标
+fprintf('\n动态性能指标:\n');
+fprintf('上升时间: %.2f 秒\n', rise_time);
+fprintf('调节时间: %.2f 秒\n', settle_time);
+fprintf('超调量: %.2f%%\n', overshoot * 100);
+fprintf('稳态误差: %.4f 度\n', abs(yss - setpoint));
+
+% 自定义函数：计算稳态值
+function [yss, idx] = steadyStateValue(y, t)
+    % 取最后10%数据的平均值作为稳态值
+    n = length(y);
+    idx = round(0.9 * n);
+    yss = mean(y(idx:end));
+end
+
+% 自定义函数：计算上升时间
+function tr = calcRiseTime(y, t, setpoint)
+    idx10 = find(y >= 0.1 * setpoint, 1);
+    idx90 = find(y >= 0.9 * setpoint, 1);
+    if isempty(idx10) || isempty(idx90)
+        tr = NaN;
+    else
+        tr = t(idx90) - t(idx10);
+    end
+end
+
+% 自定义函数：计算调节时间（2%误差带）
+function ts = calcSettleTime(y, t, setpoint)
+    tolerance = 0.02 * setpoint;
+    n = length(y);
+    ts = NaN;
+    
+    for i = n:-1:1
+        if any(abs(y(i:end) - setpoint) > tolerance)
+            % 确保索引不超出范围
+            if (i+1) <= n
+                ts = t(i+1);
+            else
+                ts = t(end);
+            end
+            break;
+        end
+    end
+    
+    % 如果没有找到超出容差的点，说明系统一开始就稳定
+    if isnan(ts)
+        ts = t(1);
+    end
+end
+
+% 自定义函数：计算超调量
+function os = calcOvershoot(y, setpoint)
+    y_max = max(y);
+    os = (y_max - setpoint) / setpoint;
+end
+
+% 遗传算法适应度函数（改进版）
+function fitness = pid_fitness(x, sys, setpoint, s)
+    % 提取PID参数
+    Kp = x(1);
+    Ki = x(2);
+    Kd = x(3);
+    
+    % 构建带滤波器的PID控制器
+    filter_pole = 5;  % 与主程序保持一致
+    pid_controller = Kp + Ki/s + Kd*s/(s/filter_pole + 1);
+    
+    % 构建闭环系统
+    sys_cl = feedback(pid_controller * sys, 1);
+    
+    % 延长仿真时间以适应大时间常数系统
+    t = 0:0.1:5000;
+    
+    try
+        % 计算阶跃响应
+        y = step(setpoint * sys_cl, t);
+        
+        % 确保y是向量
+        y = y(:);
+        t = t(:);
+        
+        % 计算误差信号
+        error_signal = setpoint - y;
+        
+        % 计算控制器输出
+        u = lsim(pid_controller, error_signal, t);
+        
+        % 计算ITAE性能指标（积分时间绝对误差） - 更重视后期误差
+        error = abs(y - setpoint);
+        time_weight = t.^1.5;  % 增加时间权重，更关注长时间的误差
+        fitness = sum(time_weight .* error) * 0.1;  % 数值积分
+        
+        % 计算超调量
+        y_max = max(y);
+        overshoot = (y_max - setpoint) / setpoint;
+        
+        % 改进的超调惩罚 - 对任何超调都进行惩罚
+        if overshoot > 0
+            fitness = fitness + 5000 * overshoot^2;  % 平方惩罚，加重超调的影响
+        end
+        
+        % 稳定性检查 - 增加稳态误差惩罚权重
+        y_final = y(end);
+        steady_error = abs(y_final - setpoint);
+        if steady_error > 1  % 稳态误差超过1度就开始惩罚
+            fitness = fitness + 1e7 * steady_error^2;  % 平方惩罚，更敏感地响应稳态误差
+        end
+        
+        % 控制器输出约束 - 降低控制能量
+        u_max = 100;  % 最大控制信号限制
+        control_energy = sum(u.^2) * 0.1;  % 控制能量积分
+        if max(abs(u)) > u_max
+            fitness = fitness + 1e5 * (max(abs(u))/u_max - 1)^2;  % 超出限制的惩罚
+        end
+        
+        % 对积分项过大进行惩罚（避免积分饱和）
+        if Ki > 1
+            fitness = fitness + 500 * Ki;  % 对过大的Ki进行惩罚
+        end
+        
+    catch ME
+        % 捕获异常并返回大惩罚值
+        fprintf('仿真错误: %s\n', ME.message);
+        fitness = 1e10;
+    end
+end    
